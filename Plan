@@ -1,0 +1,797 @@
+# SpecSync Agent
+## AI-Powered Architectural Guardrail for GitHub Repositories
+### Complete Product & Architecture Plan — v2.0 · March 2026
+
+---
+
+## Table of Contents
+
+1. [Executive Summary](#1-executive-summary)
+2. [The Problem](#2-the-problem)
+3. [System Architecture](#3-system-architecture)
+4. [The Two Triggers](#4-the-two-triggers)
+5. [The Two Scenarios](#5-the-two-scenarios)
+6. [Misalignment Handling](#6-misalignment-handling)
+7. [Wiki as Knowledge Base](#7-wiki-as-knowledge-base)
+8. [Test Generation Strategy](#8-test-generation-strategy)
+9. [Technical Stack](#9-technical-stack)
+10. [GitHub Action Delivery](#10-github-action-delivery)
+11. [Build Roadmap](#11-build-roadmap)
+12. [What Makes This Novel](#12-what-makes-this-novel)
+13. [Open Questions & Risks](#13-open-questions--risks)
+
+---
+
+## 1. Executive Summary
+
+**SpecSync Agent** is a GitHub Action that acts as an autonomous architectural guardrail on every commit and pull request. It reads feature specifications from the repository's GitHub Wiki — owned exclusively by architects, product managers, and QA — and validates every code change against those specs before tests are written or a PR is cleared for review.
+
+It exists because junior developers and AI coding tools (vibe coding) generate plausible-looking code that has no meaningful alignment with what was actually specified — wrong architecture, missing tests, feature creep, and zero coverage of acceptance criteria.
+
+> **Core pitch:**
+> "SpecSync Agent is the guardrail between vibe coding and production. It enforces architectural intent on every commit, generates tests from acceptance criteria automatically, and ensures junior developers can't ship code that contradicts the spec — without ever leaving GitHub."
+
+### Who It's For
+
+| Role | What They Get |
+|------|--------------|
+| **Architect** | Their spec is enforced on every commit. Wiki is their domain. Misalignment escalates to them. |
+| **QA** | Acceptance criteria they wrote get converted to tests automatically on every aligned commit. |
+| **Engineering Manager** | Junior developers and AI tools can't bypass the architecture or skip tests. |
+| **Developer** | Clear, inline feedback on what's missing. Self-service fixes for unintentional misalignment. |
+
+---
+
+## 2. The Problem
+
+### The Vibe Coding Crisis
+
+AI coding assistants have dramatically accelerated code output — but not code quality or architectural alignment. Junior developers using tools like GitHub Copilot, Cursor, or ChatGPT routinely generate:
+
+- Code that works in isolation but breaks architectural boundaries
+- Features that partially implement requirements, missing edge cases
+- Zero unit tests, zero e2e tests, zero validation against acceptance criteria
+- Scope creep — building adjacent features that were never specified
+- Architecture violations — bypassing layers, creating tight coupling, ignoring conventions
+
+The result: code gets merged, tests get skipped, and the architect finds out in a production incident.
+
+### Why Existing Tools Don't Solve It
+
+- **Linters / static analysis** — check syntax and style, not architectural intent
+- **Code review** — manual, inconsistent, happens after the fact, architects become bottlenecks
+- **AI test generators** — write tests for what the code does, not what it was supposed to do
+- **Copilot / cursor** — amplify the developer's direction, right or wrong
+- **CI pipelines** — run existing tests, don't generate or validate new ones
+
+None of these answer the question: **"Does this code do what was specified?"**
+
+---
+
+## 3. System Architecture
+
+### Three Core Components
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    GITHUB WIKI                              │
+│            (repo.wiki.git — separate git repo)              │
+│     Write access: Architect, PM, QA only                   │
+│     Read access: Everyone including SpecSync bot            │
+│     Contains: Feature specs, acceptance criteria,           │
+│               integration maps, API contracts               │
+└──────────────────────┬──────────────────────────────────────┘
+                       │ read on every run
+                       │ write: Option B wiki PR only
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│              SPECSYNC AGENT (GitHub Action)                 │
+│                                                             │
+│  1. Parse git diff (what changed)                          │
+│  2. Fetch relevant Wiki spec pages via GitHub API          │
+│  3. Call Claude API: diff + spec → alignment verdict       │
+│  4. Map impact radius (unit + integration scope)           │
+│  5. Generate tests OR produce analysis file                │
+│  6. Commit output back to branch via GitHub API            │
+└──────────────────────┬──────────────────────────────────────┘
+                       │ commits to branch
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    CODE REPOSITORY                          │
+│     /tests/                  ← committed on alignment      │
+│     /feature-alignment/      ← committed on misalignment   │
+│       (feature branches only, deleted on merge)            │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Access Control Model
+
+```
+WIKI (repo.wiki.git)
+  ├── Architect        → read + write
+  ├── Product Manager  → read + write
+  ├── QA Lead          → read + write
+  ├── Developer        → read only
+  └── SpecSync Bot     → read always
+                          write only for Option B wiki PRs
+                          (requires architect/PM approval)
+
+CODE REPO
+  ├── Developer        → read + write (feature branches)
+  ├── Architect        → read + write + merge to main
+  └── SpecSync Bot     → write to feature branches only
+                          (test files + analysis files)
+                          cannot push to main/develop
+```
+
+---
+
+## 4. The Two Triggers
+
+SpecSync is activated by two completely separate events.
+
+### Trigger 1 — Code Commit or PR
+
+Standard GitHub Actions event. Fires on every push to a feature branch and every PR open/update.
+
+```yaml
+on:
+  push:
+    branches-ignore: [main, develop]   # feature branches only
+  pull_request:
+    types: [opened, synchronize]
+```
+
+Nothing special here — this is how every GitHub Action works.
+
+### Trigger 2 — Wiki Spec Update
+
+This is the smart trigger. When an architect updates a spec page in the Wiki, all blocked PRs that were waiting on that spec get automatically re-evaluated.
+
+GitHub Wiki is a separate Git repo (`repo.wiki.git`). It does not natively fire GitHub Actions. The solution is a three-part relay:
+
+```
+Architect edits Wiki page and saves
+          ↓
+wiki.git receives a commit
+          ↓
+Wiki webhook fires (configured in repo Settings → Webhooks)
+POST to relay endpoint with push payload
+          ↓
+Relay function (Cloudflare Worker / AWS Lambda — ~20 lines)
+Extracts: which spec page changed, new commit SHA
+Calls GitHub API:
+  POST /repos/{owner}/{repo}/dispatches
+  {
+    "event_type": "wiki-spec-updated",
+    "client_payload": {
+      "spec_page": "feature-auth",
+      "wiki_sha": "abc123"
+    }
+  }
+          ↓
+repository_dispatch fires in CODE REPO's GitHub Action
+          ↓
+SpecSync wakes up with wiki-spec-updated context
+Queries: which open PRs have a /feature-alignment/ file
+         that references this spec page?
+Re-runs alignment check on each affected PR
+```
+
+#### Why a Relay Function?
+
+The wiki webhook fires a raw `push` event payload. The GitHub dispatch API requires a specific JSON format plus an auth token. The relay is the translation layer between them — it's a one-time setup, ~20 lines of code, and runs on Cloudflare Workers for free.
+
+#### Relay Function (complete):
+
+```javascript
+// Cloudflare Worker — wiki-to-dispatch relay
+export default {
+  async fetch(request, env) {
+    const payload = await request.json();
+
+    // Extract changed wiki page from push payload
+    const changedFiles = payload.commits
+      ?.flatMap(c => [...c.added, ...c.modified]) ?? [];
+
+    if (changedFiles.length === 0) return new Response('no pages changed');
+
+    // Fire repository_dispatch on the code repo
+    const response = await fetch(
+      `https://api.github.com/repos/${env.REPO_OWNER}/${env.REPO_NAME}/dispatches`,
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': `token ${env.GITHUB_TOKEN}`,
+          'Accept': 'application/vnd.github+json',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          event_type: 'wiki-spec-updated',
+          client_payload: {
+            spec_pages: changedFiles,
+            wiki_sha: payload.after,
+            updated_by: payload.pusher?.name,
+          }
+        })
+      }
+    );
+
+    return new Response(response.ok ? 'dispatched' : 'failed', {
+      status: response.ok ? 200 : 500
+    });
+  }
+};
+```
+
+---
+
+## 5. The Two Scenarios
+
+### Scenario 1 — PR Exists
+
+```
+Developer opens PR (or pushes new commit to existing PR)
+                    ↓
+          SpecSync triggers on pull_request event
+                    ↓
+          Parse diff + fetch Wiki spec pages
+                    ↓
+          Call Claude API → alignment verdict
+                    ↓
+         ┌──────────┴──────────┐
+         ✅ ALIGNED            ❌ MISALIGNED
+         ↓                     ↓
+Bot pushes commit         Bot pushes commit
+to PR branch:             to PR branch:
+                          
+/tests/                   /feature-alignment/
+  auth.test.ts              pr-{number}-analysis.md
+  auth.integ.ts             (overwrites previous
+                             if exists)
+         ↓                     ↓
+PR check: ✅ PASSED       PR check: ❌ BLOCKED
+"Tests committed.         "Changes required.
+ Ready for review."        See feature-alignment/"
+                                ↓
+                     ┌──────────┴──────────┐
+                     ↓                     ↓
+              DEVELOPER             ARCHITECT / PM / QA
+              fixes code,           updates Wiki spec page
+              pushes commit              ↓
+                     ↓            wiki webhook fires
+              new cycle →          → relay → dispatch
+              SpecSync re-runs          ↓
+              on PR branch        SpecSync re-runs on
+                                  all PRs blocked on
+                                  this spec page
+                                       ↓
+                                  New cycle for each PR
+```
+
+**On merge to main/develop:**
+- `/feature-alignment/` folder is auto-deleted by a post-merge cleanup step
+- `/tests/` files remain — they belong in main
+- Main branch never contains alignment analysis files
+
+### Scenario 2 — Commit, No PR Yet
+
+```
+Developer pushes commit to feature branch
+(no PR open)
+                    ↓
+          SpecSync triggers on push event
+                    ↓
+          Parse diff + fetch Wiki spec pages
+                    ↓
+          Call Claude API → alignment verdict
+                    ↓
+         ┌──────────┴──────────┐
+         ✅ ALIGNED            ❌ MISALIGNED
+         ↓                     ↓
+Bot pushes commit         Bot pushes commit
+to same branch:           to same branch:
+
+/tests/                   /feature-alignment/
+  auth.test.ts              commit-{sha}-analysis.md
+  auth.integ.ts
+         ↓                     ↓
+Commit comment posted:    Commit comment posted:
+                          
+"✅ Tests written.        "❌ Code not aligned
+ 14 tests committed        with spec.
+ to /tests/.               Review /feature-alignment/
+ Ready to open PR."        for details.
+                          
+                           Fix the gaps and push
+                           again. If you believe
+                           the requirements have
+                           changed, contact your
+                           architect before opening
+                           a PR."
+                                ↓
+                     Developer should NOT open PR yet
+                     Fix → push → new cycle
+```
+
+---
+
+## 6. Misalignment Handling
+
+### What the Analysis File Contains
+
+When SpecSync writes `/feature-alignment/pr-{number}-analysis.md`, it contains a precise, actionable breakdown — not a vague "failed" message:
+
+```markdown
+# SpecSync Alignment Report
+**PR:** #123
+**Spec:** feature-auth.md v2.1
+**Checked:** 2026-03-15 14:32 UTC
+**Status:** ❌ MISALIGNED
+
+---
+
+## What Was Specified
+From: [feature-auth.md](wiki/feature-auth.md) — Acceptance Criteria #2
+
+> "Failed login after 5 attempts locks the account for 15 minutes.
+>  Locked accounts return HTTP 423 with a retry-after header."
+
+---
+
+## What Was Built
+`src/auth/login.service.ts` — `attemptLogin()` function
+
+Failed attempts are incremented in `failedAttempts` counter and
+logged to the audit table. No lockout mechanism was found.
+No 423 response path exists in the controller.
+
+---
+
+## Gaps
+
+- [ ] Missing: lockout trigger after 5 failed attempts
+- [ ] Missing: 15-minute lockout timer / expiry logic
+- [ ] Missing: HTTP 423 response with `Retry-After` header
+- [ ] Missing: unlock mechanism after lockout period expires
+
+---
+
+## Tests That Cannot Be Written Until Fixed
+
+The following test cases are required by the spec but cannot
+be generated because the implementation does not exist:
+
+- `should lock account after 5 consecutive failed attempts`
+- `should return HTTP 423 when account is locked`
+- `should include Retry-After header in 423 response`
+- `should automatically unlock account after 15 minutes`
+- `should reset failed attempt counter on successful login`
+
+---
+
+## Next Steps
+
+**If you missed this in the spec:**
+Implement the missing lockout logic above and push a new commit.
+SpecSync will re-run automatically.
+
+**If you believe the requirements have changed:**
+Do not open a PR. Contact your architect or PM and ask them
+to update the Wiki spec. SpecSync will automatically re-check
+this branch once the spec is updated.
+```
+
+### The Overwrite Rule
+
+Every new cycle overwrites the previous analysis file. There is always exactly one file — always the current state. No history accumulation, no noise.
+
+```
+Cycle 1: 3 gaps found → analysis file written with 3 gaps
+Developer fixes 2 gaps, pushes
+Cycle 2: 1 gap remaining → analysis file OVERWRITTEN with 1 gap
+Developer fixes final gap, pushes
+Cycle 3: Aligned → analysis file DELETED, tests committed
+```
+
+### Infinite Loop Prevention
+
+Bot commits never re-trigger SpecSync:
+
+```yaml
+# In the workflow file
+jobs:
+  specsync:
+    if: "!contains(github.event.head_commit.message, '[specsync]')"
+```
+
+All bot commits use the message prefix `[specsync]` — the condition skips them entirely.
+
+---
+
+## 7. Wiki as Knowledge Base
+
+### Structure
+
+The Wiki is the single source of truth. Pages are Markdown, edited directly in the GitHub Wiki UI by architects, PMs, and QA.
+
+```
+Wiki Pages
+├── Home                    ← index / navigation
+├── Project-Goals           ← overall product objectives
+├── Architecture-Overview   ← system design, tech decisions
+├── Feature-Auth            ← auth spec, acceptance criteria
+├── Feature-Payments        ← payments spec
+├── Feature-Dashboard       ← dashboard spec
+├── Integration-Map         ← who calls who
+├── API-Contracts           ← endpoint input/output shapes
+└── Changelog               ← log of spec updates with dates
+```
+
+### Feature Spec Page Template
+
+Every feature page follows this structure so SpecSync can reliably parse it:
+
+```markdown
+# Feature: User Authentication
+**Status:** active
+**Version:** 2.1
+**Owner:** @arch-sarah
+**Last Updated:** 2026-03-10
+
+## Objective
+Allow users to authenticate securely with email and password.
+Sessions are managed via JWT with refresh token rotation.
+
+## Acceptance Criteria
+1. User can log in with a valid email and password
+2. Failed login after 5 attempts locks account for 15 minutes
+3. Locked accounts return HTTP 423 with Retry-After header
+4. JWT access token expires after 24 hours
+5. Refresh token is valid for 30 days and rotates on use
+6. Logout invalidates the refresh token immediately
+
+## Out of Scope
+- OAuth / social login → tracked in Feature-Social-Auth
+- Biometric authentication → not in current roadmap
+- SSO / SAML → Enterprise tier only
+
+## Edge Cases
+- Login attempt with empty password field
+- Email with subaddressing (user+tag@domain.com)
+- Concurrent login from two different devices
+- Login attempt on a deleted account
+
+## Integrations
+- Called by: AuthController, DashboardService, AdminPanel
+- Calls: UserRepository, TokenService, AuditLogger, EmailService
+- Exposes: POST /auth/login, POST /auth/refresh, DELETE /auth/logout
+
+## API Contract
+### POST /auth/login
+Input:  { email: string, password: string }
+Output: { accessToken: string, refreshToken: string, expiresIn: number }
+Errors:
+  401 — invalid credentials
+  423 — account locked (includes Retry-After header)
+  429 — rate limited
+```
+
+### Wiki Access Enforcement
+
+GitHub Wiki permissions mirror the repo's collaborator settings — but with a key configuration:
+
+```
+Repo Settings → Wikis
+  ✅ Enable Wiki
+  ❌ Allow contributors to edit pages  ← DISABLE THIS
+
+Effect:
+  - Only collaborators with Write or Admin role can edit
+  - Assign Architect / PM / QA as collaborators with Write
+  - Developers get Read-only (or no collaborator role at all
+    on private repos — they can still read the published wiki)
+```
+
+For Option B wiki updates (developer claims requirements changed), SpecSync opens a **Pull Request on the wiki repo** — not a direct commit. Architect or PM reviews and merges it. This keeps the wiki change gated behind a human decision.
+
+---
+
+## 8. Test Generation Strategy
+
+### Test Types Generated
+
+| Type | When Generated | What It Tests |
+|------|---------------|---------------|
+| **Unit — Positive** | Every aligned commit | Feature does exactly what spec says |
+| **Unit — Negative** | Every aligned commit | Graceful failure outside spec boundaries |
+| **Unit — Edge Cases** | Every aligned commit | Boundary values from the spec's Edge Cases section |
+| **Integration** | When impact radius > 1 service | Cross-service communication after the change |
+| **Contract** | When API endpoint modified | Input/output shapes match API Contract in Wiki |
+
+### Impact Radius Mapping
+
+Before generating integration tests, SpecSync maps how far the change reaches:
+
+1. Parse diff → identify changed functions and classes
+2. Traverse codebase import/dependency graph → find all callers
+3. Cross-reference Wiki Integration Map → documented service dependencies
+4. Cross-reference Wiki API Contracts → modified endpoints
+5. Decide scope: unit only, or unit + integration + contract tests
+
+**Example:**
+> Developer modifies `attemptLogin()`. SpecSync detects it is called by `AuthController`, `AdminPanel`, and the `POST /auth/login` endpoint is in the diff. Tests are written for the function itself, for `AuthController`'s usage, and a contract test for the API endpoint shape.
+
+### Test File Location
+
+```
+/tests/
+  unit/
+    auth.login.test.ts          ← positive + negative + edge cases
+  integration/
+    auth.controller.integ.ts    ← cross-service tests
+  contract/
+    auth.api.contract.ts        ← API contract tests
+```
+
+### Test Naming Convention
+
+```typescript
+describe('attemptLogin()', () => {
+  // Positive — from acceptance criteria
+  it('should return access and refresh tokens on valid credentials')
+  it('should reset failed attempt counter on successful login')
+
+  // Negative — from spec boundaries
+  it('should return 401 when password is incorrect')
+  it('should return 423 and lock account after 5 failed attempts')
+  it('should include Retry-After header in 423 response')
+
+  // Edge cases — from spec edge cases section
+  it('should handle email with subaddressing format')
+  it('should reject empty password without calling UserRepository')
+})
+```
+
+---
+
+## 9. Technical Stack
+
+### Component Map
+
+| Layer | Technology |
+|-------|-----------|
+| **Trigger — code** | GitHub Actions `on: [push, pull_request]` |
+| **Trigger — wiki** | Wiki webhook → Cloudflare Worker relay → `repository_dispatch` |
+| **AI reasoning** | Claude API (`claude-sonnet-4`) — diff + wiki spec → verdict + tests |
+| **Wiki reading** | GitHub REST API: `GET /repos/{owner}/{repo}/wiki/pages/{title}` |
+| **Wiki PR (Option B)** | GitHub REST API: commit to `repo.wiki.git` branch → open PR |
+| **Test output** | Committed to branch via GitHub REST API |
+| **Analysis output** | Committed to `/feature-alignment/` via GitHub REST API |
+| **PR check status** | GitHub Checks API — pass/fail status on the PR |
+| **PR comments** | GitHub PR Review API — structured inline review |
+| **Post-merge cleanup** | GitHub Action step on `pull_request: closed` event |
+| **Bot identity** | GitHub App (own identity, own token, clear audit trail) |
+| **Packaging** | Reusable GitHub Action published to GitHub Marketplace |
+
+### GitHub Action Workflow File
+
+```yaml
+# .github/workflows/specsync.yml
+name: SpecSync Agent
+
+on:
+  push:
+    branches-ignore: [main, develop, staging]
+  pull_request:
+    types: [opened, synchronize, reopened]
+  pull_request:
+    types: [closed]        # for post-merge cleanup
+  repository_dispatch:
+    types: [wiki-spec-updated]   # fired by wiki relay
+
+jobs:
+  specsync:
+    # Skip bot commits to prevent infinite loop
+    if: "!contains(github.event.head_commit.message, '[specsync]')"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      contents: write        # commit test + analysis files
+      pull-requests: write   # post reviews, set check status
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Run SpecSync Agent
+        uses: your-org/specsync-agent@v1
+        with:
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          wiki-relay-secret: ${{ secrets.WIKI_RELAY_SECRET }}
+
+  cleanup:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Remove feature-alignment folder
+        run: |
+          if [ -d "feature-alignment" ]; then
+            git rm -rf feature-alignment/
+            git commit -m "[specsync] cleanup: remove alignment analysis post-merge"
+            git push
+          fi
+```
+
+### Security Model
+
+- `ANTHROPIC_API_KEY` — stored in GitHub Secrets, never in code or wiki
+- `GITHUB_TOKEN` — auto-generated per run, scoped to the repo
+- Wiki webhook uses HMAC-SHA256 signature verification — relay validates before dispatching
+- Bot (GitHub App) operates with minimum required permissions
+- Option B wiki changes go through PR review — bot cannot force-push to wiki main branch
+
+---
+
+## 10. GitHub Action Delivery
+
+### How It's Packaged
+
+SpecSync Agent is distributed as a **composite GitHub Action** on the GitHub Marketplace. Any team adds it to their repo with one workflow file — no infrastructure to manage.
+
+```yaml
+# That's all a team needs to add to their repo:
+- name: Run SpecSync Agent
+  uses: specsync/specsync-agent@v1
+  with:
+    anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+    github-token: ${{ secrets.GITHUB_TOKEN }}
+```
+
+### Action Repository Structure
+
+```
+specsync-agent/                  ← the published action repo
+  action.yml                     ← action metadata + inputs
+  src/
+    index.ts                     ← entry point
+    diff-parser.ts               ← parse git diff
+    wiki-reader.ts               ← fetch spec pages from wiki
+    alignment-engine.ts          ← call Claude API
+    impact-mapper.ts             ← dependency graph traversal
+    test-generator.ts            ← generate and commit tests
+    analysis-writer.ts           ← write misalignment analysis
+    pr-reporter.ts               ← post GitHub PR review
+    wiki-dispatch-handler.ts     ← handle wiki-spec-updated events
+  relay/
+    cloudflare-worker.js         ← wiki → dispatch relay (deploy once)
+  docs/
+    setup.md
+    wiki-template.md             ← feature spec page template
+    access-control.md
+```
+
+### Setup for a New Repo (5 steps)
+
+1. Add `.github/workflows/specsync.yml` with the workflow file above
+2. Add `ANTHROPIC_API_KEY` to repo secrets
+3. Deploy the Cloudflare Worker relay (one-time, per organisation)
+4. Configure wiki webhook to point at the relay URL
+5. Create Wiki pages for features using the spec template
+
+---
+
+## 11. Build Roadmap
+
+### Phase Overview
+
+| Phase | Name | Deliverable | Timeline |
+|-------|------|-------------|----------|
+| **1** | Core Loop | Trigger → Claude API → aligned test commit OR analysis file commit | Weeks 1–5 |
+| **2** | Wiki Integration | Read from GitHub Wiki, wiki relay trigger, Option B wiki PR | Weeks 6–10 |
+| **3** | Integration Tests | Impact radius mapping, integration + contract test generation | Weeks 11–16 |
+| **4** | Marketplace & Polish | Published GitHub Action, onboarding, analytics, multi-language | Weeks 17–22 |
+
+---
+
+### Phase 1 — Core Loop (Weeks 1–5)
+**Goal:** End-to-end working cycle with a flat Markdown spec file.
+
+- [ ] GitHub Action triggered on `push` and `pull_request`
+- [ ] Parse `git diff` to extract changed files and functions
+- [ ] Read spec from a flat file (pre-wiki, for testing)
+- [ ] Call Claude API: diff + spec → alignment verdict
+- [ ] Aligned: generate unit tests, commit to branch via GitHub API
+- [ ] Misaligned: write analysis file, commit to `/feature-alignment/`
+- [ ] Set PR check status pass/fail via GitHub Checks API
+- [ ] Bot commit prefix `[specsync]` to skip re-trigger
+- [ ] Post-merge cleanup step removes `/feature-alignment/`
+
+**Success metric:** A real commit generates tests or an analysis file within 3 minutes.
+
+---
+
+### Phase 2 — Wiki Integration (Weeks 6–10)
+**Goal:** Replace flat file with live GitHub Wiki as the KB.
+
+- [ ] Read spec pages from GitHub Wiki via REST API
+- [ ] Map spec pages to feature areas from the diff
+- [ ] Deploy Cloudflare Worker relay
+- [ ] Configure wiki webhook → relay → `repository_dispatch`
+- [ ] Handle `wiki-spec-updated` event: find blocked PRs, re-run
+- [ ] Implement Option B wiki PR flow (bot opens PR on wiki repo)
+- [ ] Analysis file references exact spec page and version
+- [ ] Post PR review comment linking to specific wiki page
+
+**Success metric:** Architect updates wiki spec → blocked PR automatically re-evaluated within 2 minutes.
+
+---
+
+### Phase 3 — Integration Tests (Weeks 11–16)
+**Goal:** Expand beyond unit tests to full coverage.
+
+- [ ] Build import/dependency graph parser (TypeScript + Python initially)
+- [ ] Implement impact radius algorithm
+- [ ] Generate integration test scaffolding for cross-service changes
+- [ ] Generate contract tests for modified API endpoints
+- [ ] Parse Integration Map and API Contract sections from wiki
+- [ ] Test files organised into `/tests/unit/`, `/tests/integration/`, `/tests/contract/`
+
+**Success metric:** Change to a shared service generates tests for all documented consumers.
+
+---
+
+### Phase 4 — Marketplace & Polish (Weeks 17–22)
+**Goal:** Production-ready, publicly distributable action.
+
+- [ ] Publish to GitHub Marketplace as verified action
+- [ ] Onboarding wizard: generate initial wiki spec from existing code + README
+- [ ] Multi-language support: add Java, Go (after TypeScript + Python)
+- [ ] Test quality scoring and coverage gap detection
+- [ ] Slack/Teams notification on misalignment (for architects)
+- [ ] Analytics: alignment rate per developer, spec coverage, KB staleness alerts
+- [ ] Cost controls: per-branch rate limiting, diff deduplication
+
+---
+
+## 12. What Makes This Novel
+
+> Most CI tools ask: "Does this code have tests?"
+> Most code review asks: "Is this code readable?"
+> SpecSync Agent asks: **"Does this code do what was specified?"**
+
+| Differentiator | Why It Matters |
+|---------------|---------------|
+| **Spec-first validation** | Tests are generated from requirements, not from whatever the developer happened to build |
+| **Vibe coding guardrail** | AI-generated code gets validated against human-authored architectural intent before it touches a PR |
+| **Architect-owned KB** | The Wiki is the architect's domain. Developers cannot alter the spec — only the architect can change what counts as correct |
+| **Bidirectional feedback** | When requirements genuinely change, the wiki gets updated through a structured PR process — not silently |
+| **Wiki trigger** | The system is alive — a spec update automatically re-evaluates every blocked PR without developer action |
+| **Branch hygiene** | Analysis files live only on feature branches. Main branch is never polluted with misalignment noise |
+| **Zero new tools** | Everything lives in GitHub — wiki, actions, PR comments, check statuses. No external platforms required |
+| **Distributed QA** | QA writes acceptance criteria in the wiki once. Every commit against that feature auto-generates tests from those criteria forever |
+
+---
+
+## 13. Open Questions & Risks
+
+| Risk | Mitigation |
+|------|-----------|
+| **Wiki cold start** — Spec pages need to exist before SpecSync adds value | Phase 4 onboarding wizard generates initial specs from existing code and README. Minimum viable wiki can be set up in under an hour. |
+| **AI hallucination** — Claude may misread a diff or generate incorrect tests | Tests committed to feature branch only — developer reviews before PR merges. Low-confidence flags added to analysis output. |
+| **Wiki webhook latency** — Relay adds a hop between wiki update and re-evaluation | Cloudflare Worker cold start is <50ms. Dispatch to Action start is typically <30 seconds. Architect-to-re-evaluation cycle is under 2 minutes. |
+| **Relay is a single point of failure** — If the Worker is down, wiki trigger breaks | Code commit trigger still works independently. Wiki trigger failure is non-blocking — worst case, developer re-pushes to re-trigger. |
+| **Spec page not found** — Developer builds a feature with no corresponding wiki page | SpecSync posts a warning: "No spec page found for this change area. Architect should create one before this PR is merged." PR is not blocked, but architect is notified. |
+| **Integration test flakiness** — Auto-generated integration tests may need real fixtures | Phase 3 generates scaffolding with placeholder fixtures. Developers fill in realistic data. Full fixture generation in Phase 4. |
+| **API costs at scale** — High-frequency commit repos generate significant Claude API costs | Per-branch rate limiting. Diff deduplication for near-identical commits. Cost dashboard in Phase 4. |
+| **Multi-language scope** — Test generation quality varies by language | MVP: TypeScript/JavaScript + Python only. Java, Go added in Phase 4 based on demand. |
+| **False positive misalignments** — Spec is ambiguous, Claude interprets differently each run | Confidence score on every verdict. Developer feedback loop (confirmed alignments) improves calibration over time. |
+
+---
+
+*SpecSync Agent — Complete Product Plan · v2.0 · March 2026 · Confidential*
+*Targets: Architects, QA Leads, Engineering Managers*
