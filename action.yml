@@ -1,0 +1,69 @@
+name: 'SpecSync Agent'
+description: 'AI-powered architectural guardrail — validates code against specs, generates tests, blocks misaligned PRs'
+author: 'SpecSync'
+
+branding:
+  icon: 'shield'
+  color: 'blue'
+
+inputs:
+  anthropic-api-key:
+    description: 'Anthropic API key for Claude'
+    required: true
+
+  github-token:
+    description: 'GitHub token for API access'
+    required: true
+    default: ${{ github.token }}
+
+  spec-file:
+    description: 'Path to flat spec file (Phase 1). If not set, reads from GitHub Wiki.'
+    required: false
+    default: ''
+
+  wiki-relay-secret:
+    description: 'HMAC secret for verifying wiki webhook relay requests'
+    required: false
+    default: ''
+
+  test-framework:
+    description: 'Test framework to generate tests for (jest, vitest, pytest, mocha)'
+    required: false
+    default: 'jest'
+
+  test-language:
+    description: 'Language for test generation (typescript, javascript, python)'
+    required: false
+    default: 'typescript'
+
+  spec-directory:
+    description: 'Directory containing spec files when using flat files'
+    required: false
+    default: '.specsync/specs'
+
+  fail-on-misalignment:
+    description: 'Whether to fail the check on misalignment (true/false)'
+    required: false
+    default: 'true'
+
+  confidence-threshold:
+    description: 'Minimum confidence score (0-100) to act on alignment verdict'
+    required: false
+    default: '70'
+
+outputs:
+  alignment-status:
+    description: 'aligned or misaligned'
+
+  tests-committed:
+    description: 'Number of test files committed'
+
+  gaps-found:
+    description: 'Number of spec gaps identified'
+
+  analysis-file:
+    description: 'Path to the analysis file (if misaligned)'
+
+runs:
+  using: 'node20'
+  main: 'action-dist/index.js'
