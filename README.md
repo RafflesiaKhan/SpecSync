@@ -7,6 +7,8 @@ SpecSync Agent is a GitHub Action that validates every code change against your 
 
 [See it in action -- Demo vedio](https://youtu.be/uQp0aukxJ6Y)
 
+[Detailed blog](https://medium.com/@khan.rafflesia/the-invisible-gap-between-what-we-planned-and-what-got-built-27f7bdd57714)
+
 ## What It Does
 
 - **Reads** feature specs from your repository (`.specsync/specs/`) or GitHub Wiki
