@@ -1,0 +1,91 @@
+name: SpecSync Agent
+
+on:
+  push:
+    branches-ignore:
+      - main
+      - develop
+      - staging
+      - master
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+  repository_dispatch:
+    types: [wiki-spec-updated]
+  workflow_dispatch:
+    inputs:
+      triggered_by:
+        description: 'What triggered this run'
+        required: false
+        default: 'manual'
+      pr_number:
+        description: 'PR number to re-evaluate'
+        required: false
+      spec_pages:
+        description: 'Comma-separated spec page names'
+        required: false
+
+jobs:
+  specsync:
+    name: SpecSync — Alignment Check
+    # Skip bot commits to prevent infinite loops
+    if: |
+      !contains(github.event.head_commit.message, '[specsync]') &&
+      (github.event_name != 'pull_request' || github.event.action != 'closed')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      contents: write        # commit test + analysis files
+      pull-requests: write   # post reviews and comments
+      checks: write          # set check run status
+      issues: write          # post issue comments
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0     # Full history for accurate diffs
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run SpecSync Agent
+        uses: ./             # use local action.yml (self-referential for testing)
+        with:
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          spec-directory: '.specsync/specs'
+          test-framework: 'jest'
+          test-language: 'typescript'
+          fail-on-misalignment: 'true'
+          confidence-threshold: '70'
+
+  cleanup:
+    name: SpecSync — Post-Merge Cleanup
+    if: |
+      github.event_name == 'pull_request' &&
+      github.event.action == 'closed' &&
+      github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout merged branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Remove feature-alignment folder
+        run: |
+          if [ -d "feature-alignment" ]; then
+            git config user.name "SpecSync Agent"
+            git config user.email "specsync-bot@github.com"
+            git rm -rf feature-alignment/
+            git commit -m "[specsync] cleanup: remove alignment analysis post-merge"
+            git push
+            echo "Cleaned up feature-alignment/ directory"
+          else
+            echo "No feature-alignment/ directory found — nothing to clean up"
+          fi
