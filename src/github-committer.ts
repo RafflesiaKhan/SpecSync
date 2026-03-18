@@ -103,13 +103,21 @@ async function gitAddAndCommit(filePaths: string[], message: string): Promise<vo
   // Commit
   await exec.exec('git', ['commit', '-m', message], { silent: false });
 
-  // Push to the current branch
+  // Push to the current branch.
+  // Pull-rebase first to handle the case where another [specsync] commit was
+  // pushed between the time this job checked out and now (race condition).
   const currentBranch = await getCurrentBranch();
+
+  await exec.exec(
+    'git',
+    ['pull', '--rebase', 'origin', currentBranch],
+    { ignoreReturnCode: true, silent: true }
+  );
 
   let pushError = '';
   const exitCode = await exec.exec(
     'git',
-    ['push', 'origin', `HEAD:${currentBranch}`],
+    ['push', 'origin', `HEAD:refs/heads/${currentBranch}`],
     {
       listeners: {
         stderr: (data: Buffer) => { pushError += data.toString(); },

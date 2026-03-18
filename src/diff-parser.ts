@@ -140,6 +140,13 @@ function parseDiffText(rawDiff: string): DiffFile[] {
   return files;
 }
 
+// Paths written by SpecSync itself — never treat these as user code changes
+const SPECSYNC_MANAGED_PREFIXES = ['feature-alignment/', 'tests/'];
+
+function isSpecSyncManagedPath(filePath: string): boolean {
+  return SPECSYNC_MANAGED_PREFIXES.some(prefix => filePath.startsWith(prefix));
+}
+
 // Get the diff between HEAD and HEAD~1 (or against base for PRs)
 export async function getDiff(baseSha?: string): Promise<ParsedDiff> {
   let rawDiff = '';
@@ -180,7 +187,7 @@ export async function getDiff(baseSha?: string): Promise<ParsedDiff> {
     });
   }
 
-  const files = parseDiffText(rawDiff);
+  const files = parseDiffText(rawDiff).filter(f => !isSpecSyncManagedPath(f.path));
 
   const totalAdditions = files.reduce((sum, f) => sum + f.additions, 0);
   const totalDeletions = files.reduce((sum, f) => sum + f.deletions, 0);
