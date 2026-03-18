@@ -723,6 +723,11 @@ function parseDiffText(rawDiff) {
     }
     return files;
 }
+// Paths written by SpecSync itself — never treat these as user code changes
+const SPECSYNC_MANAGED_PREFIXES = ['feature-alignment/', 'tests/'];
+function isSpecSyncManagedPath(filePath) {
+    return SPECSYNC_MANAGED_PREFIXES.some(prefix => filePath.startsWith(prefix));
+}
 // Get the diff between HEAD and HEAD~1 (or against base for PRs)
 async function getDiff(baseSha) {
     let rawDiff = '';
@@ -758,7 +763,7 @@ async function getDiff(baseSha) {
             silent: true,
         });
     }
-    const files = parseDiffText(rawDiff);
+    const files = parseDiffText(rawDiff).filter(f => !isSpecSyncManagedPath(f.path));
     const totalAdditions = files.reduce((sum, f) => sum + f.additions, 0);
     const totalDeletions = files.reduce((sum, f) => sum + f.deletions, 0);
     const changedPaths = files.map(f => f.path).join(', ');
@@ -913,10 +918,13 @@ async function gitAddAndCommit(filePaths, message) {
     }
     // Commit
     await exec.exec('git', ['commit', '-m', message], { silent: false });
-    // Push to the current branch
+    // Push to the current branch.
+    // Pull-rebase first to handle the case where another [specsync] commit was
+    // pushed between the time this job checked out and now (race condition).
     const currentBranch = await getCurrentBranch();
+    await exec.exec('git', ['pull', '--rebase', 'origin', currentBranch], { ignoreReturnCode: true, silent: true });
     let pushError = '';
-    const exitCode = await exec.exec('git', ['push', 'origin', `HEAD:${currentBranch}`], {
+    const exitCode = await exec.exec('git', ['push', 'origin', `HEAD:refs/heads/${currentBranch}`], {
         listeners: {
             stderr: (data) => { pushError += data.toString(); },
         },
