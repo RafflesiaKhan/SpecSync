@@ -127,6 +127,16 @@ async function gitAddAndCommit(filePaths: string[], message: string): Promise<vo
 }
 
 async function getCurrentBranch(): Promise<string> {
+  // On pull_request events GitHub checks out a detached synthetic merge ref
+  // (refs/remotes/pull/N/merge), so `git rev-parse --abbrev-ref HEAD` returns
+  // "HEAD" — not a pushable branch name.
+  // GITHUB_HEAD_REF is the actual PR source branch; use it when available.
+  const headRef = process.env.GITHUB_HEAD_REF;      // pull_request source branch
+  const refName = process.env.GITHUB_REF_NAME;      // push branch name
+  if (headRef) return headRef;
+  if (refName) return refName;
+
+  // Fallback for local runs / other event types
   let branch = '';
   await exec.exec('git', ['rev-parse', '--abbrev-ref', 'HEAD'], {
     listeners: {
