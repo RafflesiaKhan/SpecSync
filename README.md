@@ -3,6 +3,10 @@ AI-Powered Architectural Guardrail for GitHub Repositories
 
 SpecSync Agent is a GitHub Action that validates every code change against your feature specifications before tests are written or a PR is cleared for review.
 
+![Demo](Demo.jpeg)
+
+[See it in action -- Demo vedio](https://youtu.be/uQp0aukxJ6Y)
+
 ## What It Does
 
 - **Reads** feature specs from your repository (`.specsync/specs/`) or GitHub Wiki
