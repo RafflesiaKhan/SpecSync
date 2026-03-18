@@ -3,6 +3,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import { ParsedDiff, SpecPage, AlignmentResult, Gap, PendingTest } from './types';
 import { formatDiffForPrompt } from './diff-parser';
 import { formatSpecForPrompt } from './wiki-reader';
+import { callClaudeWithRetry, parseJsonResponse } from './claude-utils';
 
 const ALIGNMENT_SYSTEM_PROMPT = `You are SpecSync Agent — an AI architectural guardrail for software development teams.
 
@@ -110,46 +111,15 @@ export async function checkAlignment(
   core.info('Calling Claude API for alignment check...');
   core.debug(`Diff size: ${diffText.length} chars, Spec size: ${specText.length} chars`);
 
-  let responseText = '';
+  const responseText = await callClaudeWithRetry(client, {
+    model: 'claude-sonnet-4-6',
+    max_tokens: 4096,
+    system: ALIGNMENT_SYSTEM_PROMPT,
+    messages: [{ role: 'user', content: ALIGNMENT_USER_PROMPT(diffText, specText) }],
+  });
 
-  try {
-    const message = await client.messages.create({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 4096,
-      system: ALIGNMENT_SYSTEM_PROMPT,
-      messages: [
-        {
-          role: 'user',
-          content: ALIGNMENT_USER_PROMPT(diffText, specText),
-        },
-      ],
-    });
-
-    for (const block of message.content) {
-      if (block.type === 'text') {
-        responseText += block.text;
-      }
-    }
-  } catch (err: unknown) {
-    const error = err as { message?: string };
-    core.error(`Claude API error: ${error.message}`);
-    throw err;
-  }
-
-  // Parse JSON response
-  let parsed: ClaudeAlignmentResponse;
-  try {
-    // Strip any accidental markdown code fences
-    const cleaned = responseText
-      .replace(/^```json\n?/m, '')
-      .replace(/^```\n?/m, '')
-      .replace(/```$/m, '')
-      .trim();
-
-    parsed = JSON.parse(cleaned);
-  } catch (err) {
-    core.error(`Failed to parse Claude response as JSON:\n${responseText}`);
-    // Return a safe default
+  const parsed = parseJsonResponse<ClaudeAlignmentResponse>(responseText, 'alignment');
+  if (!parsed) {
     return {
       verdict: 'no-spec',
       confidence: 0,

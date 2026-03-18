@@ -3,6 +3,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import { ParsedDiff, SpecPage, ImpactRadius, GeneratedTestFile, TestGenerationResult } from './types';
 import { formatDiffForPrompt } from './diff-parser';
 import { formatSpecForPrompt } from './wiki-reader';
+import { callClaudeWithRetry, parseJsonResponse } from './claude-utils';
 
 const TEST_SYSTEM_PROMPT = `You are SpecSync Agent — an expert test engineer.
 
@@ -96,63 +97,40 @@ export async function generateTests(
 
   core.info('Calling Claude API for test generation...');
 
-  let responseText = '';
+  const responseText = await callClaudeWithRetry(client, {
+    model: 'claude-sonnet-4-6',
+    max_tokens: 8192,
+    system: TEST_SYSTEM_PROMPT,
+    messages: [
+      {
+        role: 'user',
+        content: TEST_USER_PROMPT(
+          diffText,
+          specText,
+          suggestedTestCases,
+          framework,
+          language,
+          impact.requiresIntegrationTests,
+          impact.requiresContractTests,
+          impact.modifiedEndpoints
+        ),
+      },
+    ],
+  });
 
-  try {
-    const message = await client.messages.create({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 8192,
-      system: TEST_SYSTEM_PROMPT,
-      messages: [
-        {
-          role: 'user',
-          content: TEST_USER_PROMPT(
-            diffText,
-            specText,
-            suggestedTestCases,
-            framework,
-            language,
-            impact.requiresIntegrationTests,
-            impact.requiresContractTests,
-            impact.modifiedEndpoints
-          ),
-        },
-      ],
-    });
+  const parsedRaw = parseJsonResponse<GeneratedTestFileRaw | GeneratedTestFileRaw[]>(
+    responseText,
+    'test-generator'
+  );
 
-    for (const block of message.content) {
-      if (block.type === 'text') {
-        responseText += block.text;
-      }
-    }
-  } catch (err: unknown) {
-    const error = err as { message?: string };
-    core.error(`Claude API error during test generation: ${error.message}`);
-    throw err;
-  }
+  const parsed: GeneratedTestFileRaw[] = Array.isArray(parsedRaw)
+    ? parsedRaw
+    : parsedRaw
+    ? [parsedRaw]
+    : [];
 
-  let parsed: GeneratedTestFileRaw[];
-
-  try {
-    const cleaned = responseText
-      .replace(/^```json\n?/m, '')
-      .replace(/^```\n?/m, '')
-      .replace(/```$/m, '')
-      .trim();
-
-    parsed = JSON.parse(cleaned);
-
-    if (!Array.isArray(parsed)) {
-      throw new Error('Expected JSON array');
-    }
-  } catch (err) {
-    core.error(`Failed to parse test generation response:\n${responseText}`);
-    return {
-      files: [],
-      totalTests: 0,
-      framework,
-      language,
-    };
+  if (parsed.length === 0) {
+    return { files: [], totalTests: 0, framework, language };
   }
 
   const files: GeneratedTestFile[] = parsed.map(f => ({

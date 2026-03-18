@@ -10,6 +10,7 @@ import { generateAnalysisReport } from './analysis-writer';
 import { postPRComment, createCheckRun, buildCheckResult, postCommitComment } from './pr-reporter';
 import { commitTestFiles, commitAnalysisFile, deleteAnalysisFile } from './github-committer';
 import { handleWikiSpecUpdated, cleanupFeatureAlignmentDir } from './wiki-dispatch-handler';
+import { wasAlreadyProcessed } from './diff-cache';
 
 // ─── Entry Point ──────────────────────────────────────────────────────────────
 
@@ -52,6 +53,17 @@ async function handleCodeChange(
   octokit: ReturnType<typeof github.getOctokit>,
   ctx: SpecSyncContext
 ): Promise<void> {
+  // Step 0: Cache check — skip if this commit was already processed
+  core.info('Step 0/6: Checking diff cache...');
+  const alreadyDone = await wasAlreadyProcessed(
+    octokit, ctx.owner, ctx.repo, ctx.branch, ctx.commitSha
+  );
+  if (alreadyDone) {
+    core.info('Diff cache hit — skipping re-run for unchanged commit.');
+    core.setOutput('alignment-status', 'cached');
+    return;
+  }
+
   // Step 1: Parse the diff
   core.info('Step 1/6: Parsing git diff...');
   const baseSha = github.context.payload.pull_request?.base?.sha;

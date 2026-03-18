@@ -48,6 +48,7 @@ const core = __importStar(__nccwpck_require__(7484));
 const sdk_1 = __importDefault(__nccwpck_require__(121));
 const diff_parser_1 = __nccwpck_require__(2056);
 const wiki_reader_1 = __nccwpck_require__(6341);
+const claude_utils_1 = __nccwpck_require__(2759);
 const ALIGNMENT_SYSTEM_PROMPT = `You are SpecSync Agent — an AI architectural guardrail for software development teams.
 
 Your job is to compare a git diff (code change) against a feature specification and determine whether the code aligns with what was specified.
@@ -122,44 +123,14 @@ async function checkAlignment(diff, specs, anthropicApiKey, confidenceThreshold)
         : '(No spec provided)';
     core.info('Calling Claude API for alignment check...');
     core.debug(`Diff size: ${diffText.length} chars, Spec size: ${specText.length} chars`);
-    let responseText = '';
-    try {
-        const message = await client.messages.create({
-            model: 'claude-sonnet-4-6',
-            max_tokens: 4096,
-            system: ALIGNMENT_SYSTEM_PROMPT,
-            messages: [
-                {
-                    role: 'user',
-                    content: ALIGNMENT_USER_PROMPT(diffText, specText),
-                },
-            ],
-        });
-        for (const block of message.content) {
-            if (block.type === 'text') {
-                responseText += block.text;
-            }
-        }
-    }
-    catch (err) {
-        const error = err;
-        core.error(`Claude API error: ${error.message}`);
-        throw err;
-    }
-    // Parse JSON response
-    let parsed;
-    try {
-        // Strip any accidental markdown code fences
-        const cleaned = responseText
-            .replace(/^```json\n?/m, '')
-            .replace(/^```\n?/m, '')
-            .replace(/```$/m, '')
-            .trim();
-        parsed = JSON.parse(cleaned);
-    }
-    catch (err) {
-        core.error(`Failed to parse Claude response as JSON:\n${responseText}`);
-        // Return a safe default
+    const responseText = await (0, claude_utils_1.callClaudeWithRetry)(client, {
+        model: 'claude-sonnet-4-6',
+        max_tokens: 4096,
+        system: ALIGNMENT_SYSTEM_PROMPT,
+        messages: [{ role: 'user', content: ALIGNMENT_USER_PROMPT(diffText, specText) }],
+    });
+    const parsed = (0, claude_utils_1.parseJsonResponse)(responseText, 'alignment');
+    if (!parsed) {
         return {
             verdict: 'no-spec',
             confidence: 0,
@@ -331,6 +302,257 @@ function groupBy(arr, key) {
     }, {});
 }
 //# sourceMappingURL=analysis-writer.js.map
+
+/***/ }),
+
+/***/ 2759:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.callClaudeWithRetry = callClaudeWithRetry;
+exports.parseJsonResponse = parseJsonResponse;
+const core = __importStar(__nccwpck_require__(7484));
+// ─── Retry Wrapper ────────────────────────────────────────────────────────────
+const MAX_RETRIES = 3;
+const RETRY_DELAY_MS = 5000;
+// Error codes that are worth retrying
+function isRetryable(err) {
+    const e = err;
+    if (e.status === 429)
+        return true; // rate limited
+    if (e.status === 529)
+        return true; // overloaded
+    if (e.status != null && e.status >= 500)
+        return true; // server error
+    if (e.code === 'ECONNRESET' || e.code === 'ETIMEDOUT')
+        return true;
+    return false;
+}
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+async function callClaudeWithRetry(client, params) {
+    let lastError;
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+        try {
+            const message = await client.messages.create(params);
+            let text = '';
+            for (const block of message.content) {
+                if (block.type === 'text')
+                    text += block.text;
+            }
+            return text;
+        }
+        catch (err) {
+            lastError = err;
+            const e = err;
+            if (!isRetryable(err)) {
+                core.error(`Claude API error (non-retryable, status ${e.status}): ${e.message}`);
+                throw err;
+            }
+            if (attempt < MAX_RETRIES) {
+                const delay = RETRY_DELAY_MS * attempt; // 5s, 10s, 15s
+                core.warning(`Claude API error (attempt ${attempt}/${MAX_RETRIES}, status ${e.status}): ${e.message}. Retrying in ${delay / 1000}s...`);
+                await sleep(delay);
+            }
+        }
+    }
+    core.error(`Claude API failed after ${MAX_RETRIES} attempts`);
+    throw lastError;
+}
+// ─── Robust JSON Parser ───────────────────────────────────────────────────────
+// Three strategies, in order:
+//   1. Direct parse
+//   2. Strip markdown code fences, then parse
+//   3. Brace-counting heuristic to find embedded JSON
+function parseJsonResponse(raw, label) {
+    // Strategy 1: direct parse
+    try {
+        return JSON.parse(raw);
+    }
+    catch { /* fall through */ }
+    // Strategy 2: strip markdown code fences
+    const stripped = raw
+        .replace(/^```(?:json)?\s*/m, '')
+        .replace(/\s*```\s*$/m, '')
+        .trim();
+    try {
+        return JSON.parse(stripped);
+    }
+    catch { /* fall through */ }
+    // Strategy 3: brace-counting — find first complete JSON object or array
+    const startChar = raw.includes('[') && (!raw.includes('{') || raw.indexOf('[') < raw.indexOf('{'))
+        ? '[' : '{';
+    const endChar = startChar === '[' ? ']' : '}';
+    const startIdx = raw.indexOf(startChar);
+    if (startIdx !== -1) {
+        let depth = 0;
+        let inString = false;
+        let escape = false;
+        for (let i = startIdx; i < raw.length; i++) {
+            const ch = raw[i];
+            if (escape) {
+                escape = false;
+                continue;
+            }
+            if (ch === '\\' && inString) {
+                escape = true;
+                continue;
+            }
+            if (ch === '"') {
+                inString = !inString;
+                continue;
+            }
+            if (inString)
+                continue;
+            if (ch === startChar)
+                depth++;
+            else if (ch === endChar) {
+                depth--;
+                if (depth === 0) {
+                    try {
+                        return JSON.parse(raw.slice(startIdx, i + 1));
+                    }
+                    catch {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    core.error(`[${label}] Failed to parse JSON response using all 3 strategies. Raw response:\n${raw.slice(0, 500)}`);
+    return null;
+}
+//# sourceMappingURL=claude-utils.js.map
+
+/***/ }),
+
+/***/ 5537:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.wasAlreadyProcessed = wasAlreadyProcessed;
+exports.hashContent = hashContent;
+exports.buildCacheKey = buildCacheKey;
+const core = __importStar(__nccwpck_require__(7484));
+const crypto = __importStar(__nccwpck_require__(6982));
+// ─── Diff Cache ───────────────────────────────────────────────────────────────
+// Prevents re-running the full alignment check when the diff hasn't changed.
+//
+// Strategy: scan the last N commits on the branch for a [specsync] bot commit
+// whose message references the current commit SHA. If found, this diff was
+// already processed — skip the API calls.
+//
+// This mirrors the cache mechanism in claude-code-security-review but without
+// needing a separate cache action step — it uses the git history as the store.
+const LOOKBACK_COMMITS = 10;
+async function wasAlreadyProcessed(octokit, owner, repo, branch, commitSha) {
+    try {
+        const { data: commits } = await octokit.rest.repos.listCommits({
+            owner,
+            repo,
+            sha: branch,
+            per_page: LOOKBACK_COMMITS,
+        });
+        const shortSha = commitSha.slice(0, 7);
+        for (const commit of commits) {
+            const msg = commit.commit.message;
+            // A [specsync] commit that mentions the current short SHA was already
+            // triggered by this exact commit — no need to run again.
+            if (msg.startsWith('[specsync]') && msg.includes(shortSha)) {
+                core.info(`Diff cache hit — commit ${shortSha} was already processed (found: "${msg.slice(0, 80)}")`);
+                return true;
+            }
+        }
+    }
+    catch (err) {
+        const e = err;
+        // Non-fatal — if we can't check, just proceed with the full run
+        core.warning(`Could not check diff cache: ${e.message}`);
+    }
+    return false;
+}
+// ─── Content Hash (spec change detection) ────────────────────────────────────
+// Hash the spec content so we can detect when specs changed between runs
+// even if the code diff SHA is the same.
+function hashContent(content) {
+    return crypto.createHash('sha256').update(content).digest('hex').slice(0, 16);
+}
+// Build a composite cache key from diff SHA + spec content hash
+function buildCacheKey(commitSha, specContent) {
+    return `${commitSha.slice(0, 7)}-${hashContent(specContent)}`;
+}
+//# sourceMappingURL=diff-cache.js.map
 
 /***/ }),
 
@@ -1041,6 +1263,7 @@ const analysis_writer_1 = __nccwpck_require__(2695);
 const pr_reporter_1 = __nccwpck_require__(6545);
 const github_committer_1 = __nccwpck_require__(8747);
 const wiki_dispatch_handler_1 = __nccwpck_require__(2545);
+const diff_cache_1 = __nccwpck_require__(5537);
 // ─── Entry Point ──────────────────────────────────────────────────────────────
 async function run() {
     try {
@@ -1072,6 +1295,14 @@ async function run() {
 }
 // ─── Main Code Change Handler ─────────────────────────────────────────────────
 async function handleCodeChange(octokit, ctx) {
+    // Step 0: Cache check — skip if this commit was already processed
+    core.info('Step 0/6: Checking diff cache...');
+    const alreadyDone = await (0, diff_cache_1.wasAlreadyProcessed)(octokit, ctx.owner, ctx.repo, ctx.branch, ctx.commitSha);
+    if (alreadyDone) {
+        core.info('Diff cache hit — skipping re-run for unchanged commit.');
+        core.setOutput('alignment-status', 'cached');
+        return;
+    }
     // Step 1: Parse the diff
     core.info('Step 1/6: Parsing git diff...');
     const baseSha = github.context.payload.pull_request?.base?.sha;
@@ -1582,6 +1813,7 @@ const core = __importStar(__nccwpck_require__(7484));
 const sdk_1 = __importDefault(__nccwpck_require__(121));
 const diff_parser_1 = __nccwpck_require__(2056);
 const wiki_reader_1 = __nccwpck_require__(6341);
+const claude_utils_1 = __nccwpck_require__(2759);
 const TEST_SYSTEM_PROMPT = `You are SpecSync Agent — an expert test engineer.
 
 Your job is to generate comprehensive test files based on a feature specification and code diff.
@@ -1643,50 +1875,25 @@ async function generateTests(diff, specs, impact, suggestedTestCases, anthropicA
     const diffText = (0, diff_parser_1.formatDiffForPrompt)(diff);
     const specText = specs.map(wiki_reader_1.formatSpecForPrompt).join('\n\n---\n\n');
     core.info('Calling Claude API for test generation...');
-    let responseText = '';
-    try {
-        const message = await client.messages.create({
-            model: 'claude-sonnet-4-6',
-            max_tokens: 8192,
-            system: TEST_SYSTEM_PROMPT,
-            messages: [
-                {
-                    role: 'user',
-                    content: TEST_USER_PROMPT(diffText, specText, suggestedTestCases, framework, language, impact.requiresIntegrationTests, impact.requiresContractTests, impact.modifiedEndpoints),
-                },
-            ],
-        });
-        for (const block of message.content) {
-            if (block.type === 'text') {
-                responseText += block.text;
-            }
-        }
-    }
-    catch (err) {
-        const error = err;
-        core.error(`Claude API error during test generation: ${error.message}`);
-        throw err;
-    }
-    let parsed;
-    try {
-        const cleaned = responseText
-            .replace(/^```json\n?/m, '')
-            .replace(/^```\n?/m, '')
-            .replace(/```$/m, '')
-            .trim();
-        parsed = JSON.parse(cleaned);
-        if (!Array.isArray(parsed)) {
-            throw new Error('Expected JSON array');
-        }
-    }
-    catch (err) {
-        core.error(`Failed to parse test generation response:\n${responseText}`);
-        return {
-            files: [],
-            totalTests: 0,
-            framework,
-            language,
-        };
+    const responseText = await (0, claude_utils_1.callClaudeWithRetry)(client, {
+        model: 'claude-sonnet-4-6',
+        max_tokens: 8192,
+        system: TEST_SYSTEM_PROMPT,
+        messages: [
+            {
+                role: 'user',
+                content: TEST_USER_PROMPT(diffText, specText, suggestedTestCases, framework, language, impact.requiresIntegrationTests, impact.requiresContractTests, impact.modifiedEndpoints),
+            },
+        ],
+    });
+    const parsedRaw = (0, claude_utils_1.parseJsonResponse)(responseText, 'test-generator');
+    const parsed = Array.isArray(parsedRaw)
+        ? parsedRaw
+        : parsedRaw
+            ? [parsedRaw]
+            : [];
+    if (parsed.length === 0) {
+        return { files: [], totalTests: 0, framework, language };
     }
     const files = parsed.map(f => ({
         path: sanitizeTestPath(f.path, language),
